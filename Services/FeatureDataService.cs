@@ -1,5 +1,10 @@
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Options;
+using Scoutify.FeaturesApi.Configs;
 using Scoutify.FeaturesApi.Models;
 
 namespace Scoutify.FeaturesApi.Services;
@@ -51,6 +56,22 @@ public sealed class FeatureDataService : IFeatureDataService
     ];
 
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WatchlistItemDto>> _watchlists = new();
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly IHttpContextAccessor _httpContextAccessor;
+    private readonly ILogger<FeatureDataService> _logger;
+    private readonly StocksApiOptions _stocksApiOptions;
+
+    public FeatureDataService(
+        IHttpClientFactory httpClientFactory,
+        IHttpContextAccessor httpContextAccessor,
+        IOptions<StocksApiOptions> stocksApiOptions,
+        ILogger<FeatureDataService> logger)
+    {
+        _httpClientFactory = httpClientFactory;
+        _httpContextAccessor = httpContextAccessor;
+        _stocksApiOptions = stocksApiOptions.Value;
+        _logger = logger;
+    }
 
     public Task<IReadOnlyList<WatchlistItemDto>> GetWatchlistAsync(string userId, CancellationToken cancellationToken = default)
     {
@@ -111,20 +132,141 @@ public sealed class FeatureDataService : IFeatureDataService
     public Task<IReadOnlyList<FinancialRowDto>> GetMarketDataAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(SeedFinancial);
 
-    public Task<IReadOnlyList<AiInsightCardDto>> GetAiInsightCardsAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(SeedCards);
+    public async Task<IReadOnlyList<AiInsightCardDto>> GetAiInsightCardsAsync(CancellationToken cancellationToken = default)
+    {
+        var symbols = (_stocksApiOptions.CardSymbols ?? Array.Empty<string>())
+            .Select(s => s.Trim().ToUpperInvariant())
+            .Where(s => s.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(Math.Max(1, _stocksApiOptions.MaxCards))
+            .ToArray();
+
+        if (symbols.Length == 0)
+        {
+            return SeedCards;
+        }
+
+        var tasks = symbols.Select(symbol => BuildCardAsync(symbol, cancellationToken)).ToArray();
+        var cards = await Task.WhenAll(tasks).ConfigureAwait(false);
+        var nonNull = cards.Where(c => c is not null).Cast<AiInsightCardDto>().ToList();
+        return nonNull.Count > 0 ? nonNull : SeedCards;
+    }
 
     public async Task<AiChatReplyDto> ChatAsync(string userId, string message, CancellationToken cancellationToken = default)
     {
         _ = userId;
-        await Task.Yield();
         var trimmed = message.Trim();
         if (trimmed.Length == 0)
         {
             return new AiChatReplyDto("Ask a question about markets or a ticker.");
         }
 
-        return new AiChatReplyDto(
-            $"You asked: \"{trimmed}\". This desktop stack routes heavy analysis through the .NET worker and message bus; wire your LLM gateway here for full parity.");
+        var symbols = ExtractSymbols(trimmed).Take(3).ToArray();
+        if (symbols.Length == 0)
+        {
+            return new AiChatReplyDto("Include one or more ticker symbols like AAPL, MSFT, or TSLA to get worker-backed analysis.");
+        }
+
+        if (symbols.Length == 1)
+        {
+            var insight = await TryGetInsightAsync(symbols[0], cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(insight))
+            {
+                return new AiChatReplyDto($"Could not retrieve analysis for {symbols[0]} right now. Please try again.");
+            }
+
+            return new AiChatReplyDto(insight);
+        }
+
+        var compareTasks = symbols.Select(async symbol =>
+        {
+            var insight = await TryGetInsightAsync(symbol, cancellationToken).ConfigureAwait(false);
+            return (symbol, insight);
+        });
+
+        var compared = await Task.WhenAll(compareTasks).ConfigureAwait(false);
+        var available = compared.Where(x => !string.IsNullOrWhiteSpace(x.insight)).ToArray();
+        if (available.Length == 0)
+        {
+            return new AiChatReplyDto("Could not retrieve analysis for the requested symbols right now. Please try again.");
+        }
+
+        var lines = available.Select(x =>
+        {
+            var body = x.insight!.Length > 420 ? $"{x.insight[..420]}..." : x.insight;
+            return $"{x.symbol}: {body}";
+        });
+
+        return new AiChatReplyDto($"Comparison for {string.Join(", ", symbols)}\n\n{string.Join("\n\n", lines)}");
+    }
+
+    private async Task<AiInsightCardDto?> BuildCardAsync(string symbol, CancellationToken cancellationToken)
+    {
+        var insight = await TryGetInsightAsync(symbol, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(insight))
+        {
+            return null;
+        }
+
+        var shortened = insight.Length > 240 ? $"{insight[..240]}..." : insight;
+        return new AiInsightCardDto(
+            $"{symbol} Analysis",
+            shortened,
+            $"Generated {DateTime.UtcNow:yyyy-MM-dd HH:mm} UTC");
+    }
+
+    private async Task<string?> TryGetInsightAsync(string symbol, CancellationToken cancellationToken)
+    {
+        var baseUrl = (_stocksApiOptions.BaseUrl ?? string.Empty).Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return null;
+        }
+
+        var client = _httpClientFactory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/api/stocks/insights")
+        {
+            Content = JsonContent.Create(new { symbol })
+        };
+
+        var bearer = _httpContextAccessor.HttpContext?.Request.Headers.Authorization.ToString();
+        if (!string.IsNullOrWhiteSpace(bearer) &&
+            AuthenticationHeaderValue.TryParse(bearer, out var authHeader))
+        {
+            request.Headers.Authorization = authHeader;
+        }
+
+        try
+        {
+            using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Stocks API returned {StatusCode} for symbol {Symbol}", (int)response.StatusCode, symbol);
+                return null;
+            }
+
+            var payload = await response.Content
+                .ReadFromJsonAsync<StocksInsightResponse>(cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+            return payload?.Insight;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            _logger.LogWarning(ex, "Stocks API unavailable while fetching insight for {Symbol}", symbol);
+            return null;
+        }
+    }
+
+    private static IEnumerable<string> ExtractSymbols(string input)
+    {
+        return Regex.Matches(input.ToUpperInvariant(), @"\b[A-Z]{1,5}\b")
+            .Select(m => m.Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class StocksInsightResponse
+    {
+        public string Symbol { get; set; } = string.Empty;
+        public string Insight { get; set; } = string.Empty;
     }
 }

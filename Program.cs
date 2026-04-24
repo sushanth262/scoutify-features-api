@@ -1,6 +1,8 @@
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
+using Scoutify.FeaturesApi.Configs;
+using Scoutify.FeaturesApi.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -33,7 +35,10 @@ builder.Services
     });
 
 builder.Services.AddAuthorization();
-builder.Services.AddScoped<Scoutify.FeaturesApi.Services.IFeatureDataService, Scoutify.FeaturesApi.Services.FeatureDataService>();
+builder.Services.Configure<StocksApiOptions>(builder.Configuration.GetSection("StocksApi"));
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddHttpClient();
+builder.Services.AddScoped<IFeatureDataService, FeatureDataService>();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
